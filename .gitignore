@@ -1,0 +1,48 @@
+# === 機密情報・アップロードデータは絶対にコミットしない ===
+# Streamlit Secrets(パスワード等)
+.streamlit/secrets.toml
+
+# App Store Connect API キー
+*.p8
+
+# AdMob / Google OAuth 認証情報(クライアントシークレット・トークン)
+client_secret*.json
+*_client_secret*.json
+token.json
+admob_token.json
+credentials.json
+
+# アップロード/取り込みデータ(収益・DLは機微情報)
+data/
+*.csv
+*.tsv
+*.txt.gz
+.env
+
+# ただしサンプルデータ(合成・動作確認用)は追跡する
+!sample_data/
+!sample_data/*.csv
+!sample_data/*.tsv
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 仮想環境
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ログ
+*.log
