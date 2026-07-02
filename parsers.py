@@ -1,5 +1,6 @@
-"""パーサ層: AdMob レポート CSV と App Store Connect Sales レポート(TSV/CSV)を
-表記ゆれに寛容に読み取り、集計しやすい正規化 DataFrame に変換する。
+"""パーサ層: AdMob レポート CSV / App Store Connect Sales レポート(TSV/CSV) /
+App Store Connect 維持率エクスポート CSV を表記ゆれに寛容に読み取り、
+集計しやすい正規化 DataFrame に変換する。
 
 このモジュールは Streamlit に依存しない純粋なデータ処理層なので、
 CLI からも単体でテストできる（`python parsers.py --selftest` 参照）。
@@ -370,6 +371,263 @@ def _empty_asc() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# App Store Connect 維持率(Retention)パーサ
+# ---------------------------------------------------------------------------
+#
+# ASC「App分析 → エンゲージメント → 維持率」からエクスポートした CSV を想定。
+# 一般的な形式は「行 = コホート日(インストール日) / 列 = Day 0, Day 1, … の
+# 維持率マトリクス(ワイド形式)」。ツールによっては
+# [日付, 経過日数, 維持率] の3列(ロング形式)で来ることもあるため両対応する。
+
+_RETENTION_DATE_KEYS = [
+    "cohortdate",
+    "installdate",
+    "begindate",
+    "startdate",
+    "date",
+    "cohort",
+]
+_RETENTION_DATE_JP = ("日付", "コホート")
+_RETENTION_UNITS_KEYS = [
+    "appunits",
+    "cohortsize",
+    "totaldevices",
+    "installations",
+    "installs",
+    "devices",
+    "units",
+]
+_RETENTION_UNITS_JP = ("ユニット", "インストール", "デバイス", "台数")
+_RETENTION_LONG_DAY_KEYS = [
+    "daysafterinstall",
+    "dayssinceinstall",
+    "daysafterdownload",
+    "dayoffset",
+    "daynumber",
+    "days",
+    "day",
+]
+_RETENTION_LONG_DAY_JP = ("経過日",)
+_RETENTION_LONG_VALUE_KEYS = ["retentionrate", "retention", "rate"]
+_RETENTION_LONG_VALUE_JP = ("維持率", "リテンション", "継続率")
+
+# 経過日数として妥当な上限(「2026」等の年らしき列名の誤検出防止)。
+_DAY_OFFSET_MAX = 366
+
+
+def _find_column_jp(df: pd.DataFrame, needles: tuple[str, ...]) -> str | None:
+    """日本語の部分文字列で列名を探す。
+
+    _normalize_key は非 ASCII を落とすため、日本語ヘッダ("日付" 等)は
+    正規化ベースの _find_column では見つけられない。元列名で補完する。
+    """
+    for c in df.columns:
+        name = str(c)
+        if any(n in name for n in needles):
+            return c
+    return None
+
+
+def _day_offset_from_header(name: str) -> int | None:
+    """列名から「インストール後の経過日数」を取り出す。該当しなければ None。
+
+    対応例: "Day 1" / "day7" / "D30" / "Day 28 Retention" / "7 Days" /
+            "1日後" / "7日目" など。
+    """
+    s = str(name).strip()
+    # 日本語表記("1日後" "7日目" など)は正規化で数字以外が消えるため元列名で判定。
+    m = re.search(r"(\d+)\s*日", s)
+    if m:
+        n = int(m.group(1))
+        return n if 0 <= n <= _DAY_OFFSET_MAX else None
+    key = _normalize_key(s)
+    if not key:
+        return None
+    for pattern in (
+        r"^day0*(\d+)(?:retention|rate)?$",   # day1 / day30retention
+        r"^d0*(\d+)$",                         # d7
+        r"^0*(\d+)days?(?:retention|rate)?$",  # 7days
+        r"^0*(\d+)$",                          # 正規化で数字のみ残った場合
+    ):
+        m = re.match(pattern, key)
+        if m:
+            n = int(m.group(1))
+            if 0 <= n <= _DAY_OFFSET_MAX:
+                return n
+    return None
+
+
+def _to_percent_series(series: pd.Series) -> pd.Series:
+    """維持率セルを % 数値(0〜100 想定)に変換する。空セルは NaN のまま保持。
+
+    _to_numeric と違い 0 埋めしない。未到来コホート・プライバシー閾値未達の
+    空セルを 0% と誤認させると、平均・グラフが大きく歪むため。
+    """
+    s = series.astype(str).str.strip()
+    s = s.str.replace("%", "", regex=False).str.replace(",", "", regex=False)
+    blank = {"", "-", "–", "—", "nan", "none", "null", "n/a", "na"}
+    s = s.mask(s.str.lower().isin(blank))
+    return pd.to_numeric(s, errors="coerce")
+
+
+def parse_asc_retention(raw: bytes) -> dict[str, Any]:
+    """App Store Connect の維持率エクスポート CSV/TSV(gzip可)をパースする。
+
+    対応形式(寛容):
+      A) ワイド形式: 行 = コホート日 / 列 = "Day 0", "Day 1", … の維持率。
+         列名ゆれ("day7" "D30" "1日後" 等)・%文字・空セルに対応。
+      B) ロング形式: [日付, 経過日数, 維持率] の3列型。
+
+    戻り値:
+        {
+          "matrix": DataFrame(index=コホート日, columns=経過日数int,
+                              値=維持率%(0〜100) or NaN),
+          "long":   DataFrame[cohort_date, day, retention](NaNセルは除外済み),
+          "days":   検出した経過日数の昇順リスト,
+          "cohort_units": DataFrame[cohort_date, units](App Units 列があれば),
+          "columns": {検出した元列名のマップ},
+        }
+
+    維持率が 0〜1 の比率スケールで来た場合は 100 倍して % に揃える。
+    空セルは NaN のまま保持する(0% と区別するため)。
+    """
+    df = load_table(raw)
+    if df.empty:
+        return _empty_retention()
+
+    # --- コホート日列の検出 ---
+    col_date = _find_column(df, _RETENTION_DATE_KEYS) or _find_column_jp(
+        df, _RETENTION_DATE_JP
+    )
+    if col_date is None:
+        # 最後の手段: 値の8割以上が日付としてパースできる列を日付列とみなす。
+        for c in df.columns:
+            parsed = _parse_dates(df[c])
+            if len(parsed) > 0 and parsed.notna().mean() >= 0.8:
+                col_date = c
+                break
+    if col_date is None:
+        return _empty_retention()
+
+    # --- ワイド形式: Day N 列の検出 ---
+    day_cols: dict[str, int] = {}
+    for c in df.columns:
+        if c == col_date:
+            continue
+        off = _day_offset_from_header(c)
+        if off is not None:
+            day_cols[c] = off
+
+    col_units: str | None = None
+    col_day_long: str | None = None
+    col_val_long: str | None = None
+
+    if day_cols:
+        fmt = "wide"
+        matrix = pd.DataFrame(index=_parse_dates(df[col_date]))
+        for c, off in sorted(day_cols.items(), key=lambda kv: kv[1]):
+            matrix[off] = _to_percent_series(df[c]).to_numpy()
+        matrix = matrix[matrix.index.notna()]
+        matrix.index.name = "cohort_date"
+        # 同一コホート日の複数行(フィルタ別エクスポート等)は平均に畳む。
+        matrix = matrix.groupby(level=0).mean()
+
+        # App Units(コホート台数)列: 日付・Day 列以外から探す。
+        rest_cols = [c for c in df.columns if c != col_date and c not in day_cols]
+        if rest_cols:
+            rest = df[rest_cols]
+            col_units = _find_column(rest, _RETENTION_UNITS_KEYS) or _find_column_jp(
+                rest, _RETENTION_UNITS_JP
+            )
+    else:
+        fmt = "long"
+        col_day_long = _find_column(df, _RETENTION_LONG_DAY_KEYS) or _find_column_jp(
+            df, _RETENTION_LONG_DAY_JP
+        )
+        col_val_long = _find_column(df, _RETENTION_LONG_VALUE_KEYS) or _find_column_jp(
+            df, _RETENTION_LONG_VALUE_JP
+        )
+        if not (col_day_long and col_val_long):
+            return _empty_retention()
+        work = pd.DataFrame(
+            {
+                "cohort_date": _parse_dates(df[col_date]),
+                "day": pd.to_numeric(
+                    df[col_day_long].astype(str).str.extract(r"(\d+)", expand=False),
+                    errors="coerce",
+                ),
+                "retention": _to_percent_series(df[col_val_long]),
+            }
+        ).dropna(subset=["cohort_date", "day"])
+        if work.empty:
+            return _empty_retention()
+        work["day"] = work["day"].astype(int)
+        matrix = work.pivot_table(
+            index="cohort_date", columns="day", values="retention", aggfunc="mean"
+        )
+        matrix.index.name = "cohort_date"
+
+    if matrix.empty or matrix.dropna(how="all").empty:
+        return _empty_retention()
+
+    # 経過日数を int に揃えて昇順に整列。
+    matrix.columns = [int(c) for c in matrix.columns]
+    matrix = matrix.reindex(sorted(matrix.columns), axis=1)
+
+    # 0〜1 の比率スケールで来ていたら % に揃える(0.40 -> 40.0)。
+    # ※Day 0(=100%) を含むエクスポートなら max>1 になるため誤変換しない。
+    max_val = matrix.max().max()
+    if pd.notna(max_val) and 0 < float(max_val) <= 1.0:
+        matrix = matrix * 100.0
+
+    # 折れ線・ヒートマップ用のロング形式(NaN セルは落とす)。
+    long_df = (
+        matrix.reset_index()
+        .melt(id_vars="cohort_date", var_name="day", value_name="retention")
+        .dropna(subset=["retention"])
+    )
+    long_df["day"] = long_df["day"].astype(int)
+    long_df = long_df.sort_values(["cohort_date", "day"]).reset_index(drop=True)
+
+    # コホート台数(あれば)。
+    if col_units:
+        units_df = pd.DataFrame(
+            {
+                "cohort_date": _parse_dates(df[col_date]),
+                "units": _to_numeric(df[col_units]),
+            }
+        ).dropna(subset=["cohort_date"])
+        units_df = units_df.groupby("cohort_date", as_index=False)["units"].sum()
+    else:
+        units_df = pd.DataFrame(columns=["cohort_date", "units"])
+
+    return {
+        "matrix": matrix,
+        "long": long_df,
+        "days": [int(c) for c in matrix.columns],
+        "cohort_units": units_df,
+        "columns": {
+            "date": col_date,
+            "units": col_units,
+            "format": fmt,
+            "day_columns": {str(k): v for k, v in day_cols.items()},
+            "long_day": col_day_long,
+            "long_value": col_val_long,
+        },
+    }
+
+
+def _empty_retention() -> dict[str, Any]:
+    return {
+        "matrix": pd.DataFrame(),
+        "long": pd.DataFrame(columns=["cohort_date", "day", "retention"]),
+        "days": [],
+        "cohort_units": pd.DataFrame(columns=["cohort_date", "units"]),
+        "columns": {},
+    }
+
+
+# ---------------------------------------------------------------------------
 # 自己テスト用 CLI (sample_data を通して集計値が出るか確認する)
 # ---------------------------------------------------------------------------
 
@@ -473,6 +731,85 @@ def _selftest() -> int:
         f"総DLには空国も含める想定: {cc['total_downloads']} != 135"
     )
     print("  -> 空/N-A 国は国別Top10から除外・総DLには含む OK")
+
+    # --- (r1) 維持率: ワイド形式(%文字・空セル=NaN 保持・D1/D7/D30 抽出) ---
+    print("\n[r1] 維持率パーサ: ワイド形式 (合成CSV)")
+    synth_ret = (
+        "Date,App Units,Day 0,Day 1,Day 7,Day 14,Day 30\n"
+        "2026-06-01,120,100%,40.0%,20.0%,12.5%,8.0%\n"
+        "2026-06-02,80,100%,35.0%,15.0%,10.0%,\n"    # D30 未到来 -> NaN
+        "2026-06-03,100,100%,45.0%,,,\n"             # D7 以降未到来 -> NaN
+    )
+    r1 = parse_asc_retention(synth_ret.encode("utf-8"))
+    m1 = r1["matrix"]
+    print(f"  検出列: format={r1['columns']['format']} days={r1['days']}")
+    print(f"  matrix 形状: {m1.shape} (期待 (3, 5))")
+    assert r1["days"] == [0, 1, 7, 14, 30], f"経過日検出不正: {r1['days']}"
+    assert m1.shape == (3, 5), f"matrix 形状不正: {m1.shape}"
+    d1_0601 = float(m1.loc[pd.Timestamp("2026-06-01"), 1])
+    d7_0602 = float(m1.loc[pd.Timestamp("2026-06-02"), 7])
+    d30_0601 = float(m1.loc[pd.Timestamp("2026-06-01"), 30])
+    print(f"  D1(06/01)={d1_0601} D7(06/02)={d7_0602} D30(06/01)={d30_0601}")
+    assert d1_0601 == 40.0, f"D1 抽出不正: {d1_0601}"
+    assert d7_0602 == 15.0, f"D7 抽出不正: {d7_0602}"
+    assert d30_0601 == 8.0, f"D30 抽出不正: {d30_0601}"
+    # 空セルは 0 でなく NaN(未到来を 0% と誤認しない)
+    assert pd.isna(m1.loc[pd.Timestamp("2026-06-02"), 30]), "未到来セルが NaN でない"
+    assert pd.isna(m1.loc[pd.Timestamp("2026-06-03"), 7]), "未到来セルが NaN でない"
+    # ヒートマップ用ロング整形: 有効セルのみ(5+4+2=11)・NaN 行なし
+    l1 = r1["long"]
+    print(f"  long 行数: {len(l1)} (期待 11 = 有効セルのみ)")
+    assert len(l1) == 11, f"long 行数不正: {len(l1)}"
+    assert not l1["retention"].isna().any(), "long に NaN が混入"
+    assert set(l1.columns) == {"cohort_date", "day", "retention"}, "long 列名不正"
+    # App Units 検出
+    u1 = r1["cohort_units"]
+    assert int(u1["units"].sum()) == 300, f"App Units 合計不正: {u1['units'].sum()}"
+    print("  -> ワイド形式 / % 除去 / NaN 保持 / long 整形 / App Units OK")
+
+    # --- (r2) 維持率: 日本語ヘッダ + 比率(0〜1)スケールの自動補正 ---
+    print("\n[r2] 維持率パーサ: 日本語ヘッダ / 比率スケール")
+    synth_jp = (
+        "日付,Appユニット,0日後,1日後,7日後\n"
+        "2026/06/01,50,100%,30%,10%\n"
+        "2026/06/02,60,100%,25%,8%\n"
+    )
+    r2 = parse_asc_retention(synth_jp.encode("utf-8"))
+    assert r2["days"] == [0, 1, 7], f"日本語 Day 列検出不正: {r2['days']}"
+    jp_d1 = float(r2["matrix"].loc[pd.Timestamp("2026-06-01"), 1])
+    assert jp_d1 == 30.0, f"日本語形式 D1 不正: {jp_d1}"
+    assert int(r2["cohort_units"]["units"].sum()) == 110, "日本語 App Units 不正"
+    print(f"  日本語ヘッダ: days={r2['days']} D1(06/01)={jp_d1} OK")
+    synth_ratio = "Date,Day 1,Day 7\n2026-06-01,0.40,0.20\n2026-06-02,0.35,0.15\n"
+    r2b = parse_asc_retention(synth_ratio.encode("utf-8"))
+    ratio_d1 = float(r2b["matrix"].loc[pd.Timestamp("2026-06-01"), 1])
+    assert ratio_d1 == 40.0, f"比率スケール補正不正: {ratio_d1} != 40.0"
+    print(f"  比率スケール 0.40 -> {ratio_d1}% 補正 OK")
+
+    # --- (r3) 維持率: ロング形式([日付, 経過日数, 維持率]) ---
+    print("\n[r3] 維持率パーサ: ロング形式")
+    synth_long = (
+        "Date,Days After Install,Retention\n"
+        "2026-06-01,1,40%\n"
+        "2026-06-01,7,20%\n"
+        "2026-06-02,1,35%\n"
+    )
+    r3 = parse_asc_retention(synth_long.encode("utf-8"))
+    assert r3["columns"]["format"] == "long", "ロング形式が検出されない"
+    assert r3["days"] == [1, 7], f"ロング形式 days 不正: {r3['days']}"
+    long_d7 = float(r3["matrix"].loc[pd.Timestamp("2026-06-01"), 7])
+    assert long_d7 == 20.0, f"ロング形式 D7 不正: {long_d7}"
+    assert pd.isna(r3["matrix"].loc[pd.Timestamp("2026-06-02"), 7]), (
+        "ロング形式の欠損セルが NaN でない"
+    )
+    print(f"  ロング形式: days={r3['days']} D7(06/01)={long_d7} OK")
+
+    # --- (r4) 維持率: 解析不能データは空を返す(例外にしない) ---
+    print("\n[r4] 維持率パーサ: 解析不能フォールバック")
+    r4 = parse_asc_retention(b"foo,bar\n1,2\n")
+    assert r4["matrix"].empty, "解析不能なのに matrix が非空"
+    assert r4["days"] == [], "解析不能なのに days が非空"
+    print("  -> 不明形式は空戻り(UI 側で案内表示) OK")
 
     print("\n" + "=" * 60)
     print("RESULT:", "ALL PASS ✅" if ok else "MISSING SAMPLES ❌")

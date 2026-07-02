@@ -1,9 +1,14 @@
 # Synaps ダッシュボード
 
-Synaps アプリの **AdMob 広告収益** と **App Store ダウンロード** を、1画面のKPI・
-推移グラフとして確認できる Streamlit 製の **非公開ダッシュボード**です。
+Synaps アプリの **AdMob 広告収益** / **App Store ダウンロード** / **維持率
+（リテンション）** を確認できる Streamlit 製の **非公開ダッシュボード**です。
+画面は2タブ構成:
 
-データ投入は2通り:
+- **収益・DL タブ**: 収益・DL・eCPM の KPI と推移グラフ（従来画面）。
+- **維持率タブ**: App Store Connect の維持率 CSV から D1/D7/D30 の推移・
+  コホートヒートマップを表示（2.6 リリース前後の効果測定用）。
+
+収益・DL のデータ投入は2通り:
 
 - **手動**: CSV/TSV をアップロード（API キー不要で即動く）。
 - **自動取得**: App Store Connect API の Secrets を設定すると、サイドボタンで
@@ -39,6 +44,84 @@ Synaps アプリの **AdMob 広告収益** と **App Store ダウンロード** 
   フォールバックするため、既存動作は壊れません。
 - **認証**: `st.secrets["password"]` があれば入力を要求、無ければスキップ
   （ローカル開発用）。
+
+---
+
+## 維持率タブ（ASC 維持率 CSV アップロード方式）
+
+2.6 リリース前後で **D1/D7/D30 維持率がどう動いたか** を見える化する、
+リテンション施策の効果測定基盤です（MVP は CSV アップロード方式）。
+
+### 使い方
+
+1. [App Store Connect](https://appstoreconnect.apple.com/) → 対象 App → **App分析**
+2. **エンゲージメント → 維持率**（Retention）を開く
+3. 期間を選び、右上の **エクスポート（CSV）** でダウンロード
+4. ダッシュボードの「維持率」タブにアップロード
+
+### 表示内容
+
+- **D1/D7/D30 の KPI カード**: 直近28日コホートの平均維持率
+  （未到来・プライバシー閾値未達の空セルは NaN として平均から除外）。
+- **推移折れ線**（Altair・%軸）: コホート日別の D1/D7/D30。
+- **コホートヒートマップ**: 行=コホート日 × 列=経過日数、色=維持率。
+  Day 0（≒100%）は既定で除外して濃淡を見やすくする（チェックで切替）。
+- **2.6 リリース日の縦線マーカー**: `date_input` で指定すると全グラフに
+  黄色の点線を表示（前後比較が一目で分かる）。初期値は Secrets の
+  `RELEASE_26_DATE`（`YYYY-MM-DD` 文字列）→ セッション保持値の順で復元。
+
+```toml
+# .streamlit/secrets.toml（任意）
+RELEASE_26_DATE = "2026-07-01"
+```
+
+### 対応 CSV 形式（`parsers.parse_asc_retention`・寛容パース）
+
+- **ワイド形式**（ASC 維持率画面のエクスポート想定）:
+  行=コホート日（インストール日）、列=`Day 0, Day 1, …` の維持率マトリクス。
+  - 列名ゆれに対応: `Day 7` / `day7` / `D30` / `Day 28 Retention` / `7 Days` /
+    `1日後` / `7日目` など。日付列は `Date` / `日付` / `Cohort` 等。
+  - `%` 文字・カンマは自動除去。0〜1 の比率スケール（`0.40`）は ×100 で % に補正。
+  - 空セル（未到来コホート・プライバシー閾値未達）は **0 でなく NaN** として保持
+    （平均・グラフを歪めない）。
+  - `App Units` / `Appユニット` 等の台数列があればコホート母数として表示。
+- **ロング形式**: `[日付, 経過日数, 維持率]` の3列型（`Days After Install` /
+  `経過日数` 等）にも対応。
+- CSV/TSV・gzip・UTF-8(BOM可) 自動判定。D30 列が無いエクスポート（Day 28 まで）
+  では **Day 28 で代替**し、カードに「（Day 28 で代替）」と明示。
+
+パーサは `python parsers.py --selftest` の `[r1]〜[r4]` 節で合成 CSV により検証
+（ワイド/日本語ヘッダ/比率スケール/ロング形式/解析不能フォールバック）。
+
+### 自動取得の調査結果（Analytics Reports API）— 今回は見送り
+
+App Store Connect **Analytics Reports API**（`POST /v1/analyticsReportRequests`、
+既存 ASC JWT 認証を流用可能）で維持率の自動取得を調査した結果、
+**今回は CSV アップロード方式のみ実装**とした。理由:
+
+1. **維持率（コホート×経過日）の専用レポートが API に存在しない。**
+   Analytics Reports API のレポートは App Store Engagement / App Store Commerce /
+   App Usage / Frameworks Usage / Performance の各カテゴリで、App Usage 配下は
+   App Sessions・Installations and Deletions・Crashes 等。ASC 画面の
+   「維持率」グリッドに相当するレポートは提供されていない。
+   App Sessions（セッション＋ダウンロード日）と Installations から自前で
+   コホート計算することは理論上可能だが、Apple の維持率定義
+   （オプトインデバイス母数・プライバシー閾値によるブランク化・
+   「一度でも開いたデバイス」基準）と一致せず、ASC 画面の数値と乖離する。
+2. **非同期フローが Streamlit のボタン押下 UX に合わない。**
+   `analyticsReportRequests`（ONE_TIME_SNAPSHOT / ONGOING）を作成 →
+   レポート生成は **約24〜48時間後** → `reports` → `instances` → `segments` →
+   ダウンロード URL の5段階ポーリングが必要で、即時表示できない。
+3. **初回リクエストに Admin ロールの API キーが必要。**
+   既存キーは Sales and Reports ロール（salesReports 用）。新規レポートタイプの
+   リクエスト作成には Admin キーの発行が別途必要
+   （一度リクエスト済みなら Sales and Reports / Finance でダウンロードは可）。
+
+**将来の実装方針**（必要になったら）: Admin キーで `ONGOING` リクエストを一度
+発行しておき、日次バッチ（GitHub Actions / cron）で instances/segments を
+ポーリング取得 → App Sessions + Installations から自前コホート維持率を計算して
+`data/` にキャッシュ → ダッシュボードは既存の維持率タブ表示に流し込む。
+ただし ASC 画面の維持率と定義が異なる点を明記して運用すること。
 
 ---
 

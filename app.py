@@ -1,8 +1,12 @@
-"""Synaps 収益・DL ダッシュボード (Streamlit / CSV アップロード型)。
+"""Synaps ダッシュボード (Streamlit)。
 
-AdMob レポート CSV と App Store Connect Sales レポート(TSV/CSV, gzip可)を
-アップロードすると、収益・DL・eCPM の KPI と推移グラフを1画面で表示する。
-API キー不要。収益は機微情報のため非公開デプロイ(招待制 + 簡易パスワード)前提。
+- 「収益・DL」タブ: AdMob レポート CSV / App Store Connect Sales レポート
+  (TSV/CSV, gzip可)のアップロード(または API 自動取得)から、収益・DL・eCPM の
+  KPI と推移グラフを表示する。
+- 「維持率」タブ: App Store Connect の維持率エクスポート CSV から、D1/D7/D30 の
+  推移・コホートヒートマップを表示し、2.6 リリース前後の効果測定を支援する。
+
+収益は機微情報のため非公開デプロイ(招待制 + 簡易パスワード)前提。
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ import streamlit as st
 
 import admob_api
 import asc_api
-from parsers import parse_admob, parse_asc_sales
+from parsers import parse_admob, parse_asc_retention, parse_asc_sales
 
 st.set_page_config(page_title="Synaps ダッシュボード", layout="wide")
 
@@ -578,6 +582,321 @@ def _admob_autofetch_sidebar() -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
+# 表示: 維持率タブ (ASC 維持率 CSV アップロード方式)
+# ---------------------------------------------------------------------------
+
+# 折れ線に出すメトリクス(ラベル, 目標経過日)。CSV に Day 30 が無い場合は
+# _pick_day_column が近い列(例: Day 28)で代替する。
+_RETENTION_METRIC_TARGETS: tuple[tuple[str, int], ...] = (
+    ("D1", 1),
+    ("D7", 7),
+    ("D30", 30),
+)
+_RETENTION_COLORS = {"D1": "#38BDF8", "D7": "#A78BFA", "D30": "#F472B6"}
+_RELEASE_RULE_COLOR = "#FBBF24"
+# KPI カード「直近平均」の対象コホート窓(日)。
+_RETENTION_RECENT_WINDOW_DAYS = 28
+# ヒートマップに出す最大コホート数(行数の爆発防止。直近を優先)。
+_HEATMAP_MAX_COHORTS = 90
+
+
+def _pick_day_column(days: list[int], target: int) -> int | None:
+    """target 経過日にちょうど一致する列、無ければ十分近い列を返す。
+
+    ASC のエクスポートは Day 28 までのことが多く、D30 は Day 28 で代替する。
+    乖離が大きい(許容幅超)場合は None(そのメトリクスは非表示)。
+    Day 0(=常に100%)は代替候補から除外する。
+    """
+    candidates = [d for d in days if d > 0]
+    if not candidates:
+        return None
+    if target in candidates:
+        return target
+    best = min(candidates, key=lambda d: (abs(d - target), d))
+    tolerance = max(2, int(target * 0.15))
+    return best if abs(best - target) <= tolerance else None
+
+
+def _recent_cohort_mean(
+    matrix: pd.DataFrame,
+    day: int | None,
+    window_days: int = _RETENTION_RECENT_WINDOW_DAYS,
+) -> float | None:
+    """直近 window_days 分のコホートの維持率平均。
+
+    NaN セル(未到来・プライバシー閾値未達)は除外して平均する。
+    有効値が1つも無ければ None。
+    """
+    if day is None or matrix.empty or day not in matrix.columns:
+        return None
+    latest = matrix.index.max()
+    cutoff = latest - pd.Timedelta(days=window_days - 1)
+    values = matrix.loc[matrix.index >= cutoff, day].dropna()
+    if values.empty:
+        return None
+    return float(values.mean())
+
+
+def _release_date_input() -> date | None:
+    """「2.6 リリース日」の入力欄。グラフの縦線マーカーに使う。
+
+    初期値の優先順: セッション保持値 → Secrets の RELEASE_26_DATE(YYYY-MM-DD)。
+    入力値はウィジェット外のセッションキーに保持し、再描画後も復元する。
+    未指定(空)ならマーカー非表示。
+    """
+    stored: date | None = st.session_state.get("release_26_date")
+    if stored is None:
+        raw = ""
+        try:
+            raw = str(st.secrets.get("RELEASE_26_DATE", "")).strip()
+        except Exception:  # noqa: BLE001 — secrets.toml が無い場合
+            raw = ""
+        if raw:
+            try:
+                stored = date.fromisoformat(raw)
+            except ValueError:
+                stored = None
+    picked = st.date_input(
+        "2.6 リリース日（グラフに点線マーカー表示）",
+        value=stored,
+        format="YYYY-MM-DD",
+        key="_release_26_widget",
+        help=(
+            "未指定ならマーカー非表示。Secrets の RELEASE_26_DATE"
+            "（YYYY-MM-DD）で初期値を設定できます。"
+        ),
+    )
+    if picked is not None:
+        st.session_state["release_26_date"] = picked
+    return picked
+
+
+def _retention_trend_chart(
+    matrix: pd.DataFrame,
+    picks: dict[str, int | None],
+    release_date: date | None,
+) -> None:
+    """D1/D7/D30 のコホート日別推移折れ線(+リリース日の縦点線)を描く。"""
+    rows: list[dict[str, Any]] = []
+    for label, _target in _RETENTION_METRIC_TARGETS:
+        day = picks.get(label)
+        if day is None or day not in matrix.columns:
+            continue
+        series = matrix[day].dropna()
+        for cohort_dt, value in series.items():
+            rows.append(
+                {"cohort_date": cohort_dt, "metric": label, "retention": float(value)}
+            )
+    if not rows:
+        st.info("D1/D7/D30 に対応する経過日列が見つかりませんでした。")
+        return
+    line_df = pd.DataFrame(rows)
+    domain = [
+        label
+        for label, _t in _RETENTION_METRIC_TARGETS
+        if picks.get(label) is not None
+    ]
+    color_range = [_RETENTION_COLORS[label] for label in domain]
+    chart = (
+        alt.Chart(line_df)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X(
+                "cohort_date:T",
+                title="コホート日（インストール日）",
+                axis=alt.Axis(format="%m/%d"),
+            ),
+            y=alt.Y(
+                "retention:Q",
+                title="維持率 (%)",
+                axis=alt.Axis(format=",.1f"),
+            ),
+            color=alt.Color(
+                "metric:N",
+                title="指標",
+                scale=alt.Scale(domain=domain, range=color_range),
+            ),
+            tooltip=[
+                alt.Tooltip("cohort_date:T", title="コホート日", format="%Y-%m-%d"),
+                alt.Tooltip("metric:N", title="指標"),
+                alt.Tooltip("retention:Q", title="維持率(%)", format=",.1f"),
+            ],
+        )
+    )
+    layers: alt.LayerChart | alt.Chart = chart
+    if release_date is not None:
+        rule_df = pd.DataFrame({"release": [pd.Timestamp(release_date)]})
+        rule = (
+            alt.Chart(rule_df)
+            .mark_rule(strokeDash=[6, 4], color=_RELEASE_RULE_COLOR, size=2)
+            .encode(
+                x="release:T",
+                tooltip=[
+                    alt.Tooltip("release:T", title="2.6 リリース日", format="%Y-%m-%d")
+                ],
+            )
+        )
+        layers = chart + rule
+    st.altair_chart(layers.properties(height=320), use_container_width=True)
+
+
+def _retention_heatmap(matrix: pd.DataFrame, release_date: date | None) -> None:
+    """コホートヒートマップ(行=コホート日 / 列=経過日数 / 色=維持率)を描く。"""
+    heat = matrix.tail(_HEATMAP_MAX_COHORTS)  # index 昇順なので tail=直近コホート
+    exclude_d0 = st.checkbox(
+        "Day 0 を除外（色スケールを見やすく）",
+        value=True,
+        key="_ret_heat_exclude_d0",
+        help="Day 0 はほぼ 100% のため、含めると他セルの濃淡差が見えにくくなります。",
+    )
+    long_df = (
+        heat.reset_index()
+        .melt(id_vars="cohort_date", var_name="day", value_name="retention")
+        .dropna(subset=["retention"])
+    )
+    if long_df.empty:
+        st.info("ヒートマップに表示できるセルがありません。")
+        return
+    long_df = long_df.copy()
+    long_df["day"] = long_df["day"].astype(int)
+    if exclude_d0:
+        long_df = long_df[long_df["day"] != 0]
+        if long_df.empty:
+            st.info("Day 0 以外に表示できるセルがありません。")
+            return
+    long_df["cohort"] = pd.to_datetime(long_df["cohort_date"]).dt.strftime("%Y-%m-%d")
+    n_cohorts = int(long_df["cohort"].nunique())
+    height = min(700, max(240, 18 * n_cohorts + 80))
+    heat_chart = (
+        alt.Chart(long_df)
+        .mark_rect()
+        .encode(
+            x=alt.X("day:O", title="経過日数（インストール後）"),
+            y=alt.Y("cohort:O", title="コホート日", sort="descending"),
+            color=alt.Color(
+                "retention:Q",
+                title="維持率 (%)",
+                scale=alt.Scale(scheme="viridis", domainMin=0),
+            ),
+            tooltip=[
+                alt.Tooltip("cohort:N", title="コホート日"),
+                alt.Tooltip("day:O", title="経過日数"),
+                alt.Tooltip("retention:Q", title="維持率(%)", format=",.1f"),
+            ],
+        )
+        .properties(height=height)
+    )
+    layers: alt.LayerChart | alt.Chart = heat_chart
+    if release_date is not None:
+        # O 軸(コホート文字列)にはドメイン外の値を描けないため、
+        # リリース日以降で最初に存在するコホート行に点線を引く。
+        marks = sorted(
+            c for c in long_df["cohort"].unique() if c >= release_date.isoformat()
+        )
+        if marks:
+            rule = (
+                alt.Chart(pd.DataFrame({"cohort": [marks[0]]}))
+                .mark_rule(strokeDash=[6, 4], color=_RELEASE_RULE_COLOR, size=2)
+                .encode(y="cohort:O")
+            )
+            layers = heat_chart + rule
+    if matrix.shape[0] > _HEATMAP_MAX_COHORTS:
+        st.caption(
+            f"表示は直近 {_HEATMAP_MAX_COHORTS} コホートまで"
+            f"（CSV 全体は {matrix.shape[0]} コホート）。"
+        )
+    st.altair_chart(layers, use_container_width=True)
+
+
+def _render_retention_tab() -> None:
+    """維持率タブ本体。ASC 維持率 CSV のアップロード → パース → 可視化。"""
+    st.caption(
+        "App Store Connect の維持率（コホート別リテンション）を可視化します。"
+        "2.6 リリース前後で D1/D7/D30 がどう動いたかの効果測定用。"
+    )
+    uploaded = st.file_uploader(
+        "ASC 維持率 CSV（App分析 → エンゲージメント → 維持率 からエクスポート）",
+        type=["csv", "tsv", "txt", "gz"],
+        key="retention_csv",
+    )
+    if uploaded is None:
+        st.info(
+            "維持率 CSV をアップロードすると、D1/D7/D30 の推移と"
+            "コホートヒートマップを表示します。\n\n"
+            "**エクスポート手順**\n"
+            "1. [App Store Connect](https://appstoreconnect.apple.com/) → 対象 App"
+            " → **App分析**\n"
+            "2. **エンゲージメント → 維持率**（Retention）を開く\n"
+            "3. 期間を選び、右上の **エクスポート（CSV）** でダウンロード\n"
+            "4. このタブにアップロード\n\n"
+            "対応形式: コホート日 × 経過日数（Day 0, Day 1, …）の維持率マトリクス。"
+            "列名ゆれ（day7 / D30 / 1日後 等）・% 表記・"
+            "［日付, 経過日数, 維持率］の3列形式にも対応。"
+        )
+        return
+
+    try:
+        ret = parse_asc_retention(uploaded.getvalue())
+    except Exception as exc:  # noqa: BLE001 — UI 側フォールバック
+        st.error(f"維持率 CSV の解析に失敗しました: {exc}")
+        return
+
+    matrix: pd.DataFrame = ret["matrix"]
+    if matrix.empty:
+        st.warning(
+            "維持率データを検出できませんでした。コホート日の列（Date / 日付）と"
+            "経過日数の列（Day 1, Day 7, … / 1日後, …）を含む CSV か確認してください。"
+        )
+        return
+
+    release_date = _release_date_input()
+
+    days = [int(d) for d in ret["days"]]
+    picks = {
+        label: _pick_day_column(days, target)
+        for label, target in _RETENTION_METRIC_TARGETS
+    }
+
+    # --- ① 直近28日コホート平均の KPI カード ---
+    st.markdown(
+        f"**直近 {_RETENTION_RECENT_WINDOW_DAYS} 日コホートの平均維持率**"
+    )
+    cols = st.columns(len(_RETENTION_METRIC_TARGETS))
+    for col, (label, target) in zip(cols, _RETENTION_METRIC_TARGETS):
+        day = picks[label]
+        value = _recent_cohort_mean(matrix, day)
+        suffix = "" if (day is None or day == target) else f"（Day {day} で代替）"
+        col.metric(f"{label}{suffix}", "—" if value is None else f"{value:.1f}%")
+    st.caption(
+        "未到来・プライバシー閾値未達の空セルは平均から除外しています。"
+        "D7/D30 は経過日数が足りないコホートを含まないため、母数が少なくなります。"
+    )
+
+    st.divider()
+
+    # --- ② D1/D7/D30 推移折れ線(コホート日別) ---
+    st.subheader("D1 / D7 / D30 維持率の推移（コホート日別）")
+    if release_date is not None:
+        st.caption(f"黄色の点線 = 2.6 リリース日（{release_date}）")
+    _retention_trend_chart(matrix, picks, release_date)
+
+    st.divider()
+
+    # --- ③ コホートヒートマップ(コホート日 × 経過日数) ---
+    st.subheader("コホートヒートマップ（コホート日 × 経過日数）")
+    _retention_heatmap(matrix, release_date)
+
+    # --- 補足: コホート台数(App Units 列があれば) ---
+    units = ret["cohort_units"]
+    if isinstance(units, pd.DataFrame) and not units.empty:
+        with st.expander("コホート台数（App Units）"):
+            st.caption("維持率(%)の母数確認用。CSV に台数列があった場合のみ表示。")
+            shown = units.copy()
+            shown["cohort_date"] = pd.to_datetime(shown["cohort_date"]).dt.date
+            st.dataframe(shown, use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
 # メイン
 # ---------------------------------------------------------------------------
 
@@ -586,7 +905,16 @@ def main() -> None:
     # 認証が最優先。通過するまで st.stop() で以降(データ取得・描画・API)を止める。
     require_auth()
 
-    st.title("Synaps 収益・DL ダッシュボード")
+    st.title("Synaps ダッシュボード")
+    tab_revenue, tab_retention = st.tabs(["収益・DL", "維持率"])
+    with tab_revenue:
+        _render_revenue_dl_tab()
+    with tab_retention:
+        _render_retention_tab()
+
+
+def _render_revenue_dl_tab() -> None:
+    """従来の収益・DL 画面(タブ化に伴い関数へ移設。表示内容は無改変)。"""
     st.caption(
         "AdMob 収益と App Store ダウンロードを1画面で。"
         "CSV/TSV をアップロードして表示します(API キー不要)。"
